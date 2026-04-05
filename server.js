@@ -1,5 +1,5 @@
 // =====================================================
-// EnviroVoice Server v3.0
+// EnviroVoice Server v3.1
 // =====================================================
 
 const express = require('express');
@@ -10,7 +10,7 @@ const axios   = require('axios');
 
 const app    = express();
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server });
+const wss    = new WebSocketServer({ server, maxPayload: 64 * 1024 }); // 64KB max message
 
 // ── CORS ──────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -21,34 +21,31 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, '..')));
 
 // ── STATE ─────────────────────────────────────────────
 let minecraftData = null;
-const clients             = new Map(); // ws → { gamertag }
-const pttStates           = new Map(); // gamertag → { isTalking, isMuted }
+const clients              = new Map(); // ws → { gamertag }
+const gamertagIndex        = new Map(); // gamertag → ws  (O(1) lookup)
+const pttStates            = new Map(); // gamertag → { isTalking, isMuted }
 const voiceDetectionStates = new Map(); // gamertag → { isTalking, volume }
 
 // ── HELPERS ───────────────────────────────────────────
 function isGamertagTaken(gamertag) {
-  for (const [, data] of clients) {
-    if (data.gamertag === gamertag) return true;
-  }
-  return false;
+  return gamertagIndex.has(gamertag);
 }
 
-function broadcast(senderWs, message) {
-  wss.clients.forEach(client => {
-    if (client !== senderWs && client.readyState === 1)
-      client.send(JSON.stringify(message));
-  });
+function sendJSON(ws, obj) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
-function broadcastToAll(message) {
+// Send to everyone except optional excludeWs
+function broadcast(message, excludeWs = null) {
+  const str = JSON.stringify(message);
   wss.clients.forEach(client => {
-    if (client.readyState === 1)
-      client.send(JSON.stringify(message));
+    if (client !== excludeWs && client.readyState === 1)
+      client.send(str);
   });
 }
 
@@ -78,11 +75,8 @@ function buildMinecraftPayload() {
 // ── REST: Minecraft data push ─────────────────────────
 app.post('/minecraft-data', (req, res) => {
   minecraftData = req.body;
-  console.log('📦 Minecraft data received');
-
   const payload = buildMinecraftPayload();
-  broadcastToAll(payload);
-
+  broadcast(payload);
   res.json({
     success: true,
     pttStates:   payload.pttStates,
@@ -102,23 +96,22 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── REST: PTT states ──────────────────────────────────
 app.get('/ptt-states', (req, res) => {
-  const states = Array.from(pttStates.entries()).map(([gamertag, s]) => ({ gamertag, ...s }));
-  res.json({ pttStates: states });
+  res.json({ pttStates: Array.from(pttStates.entries()).map(([g, s]) => ({ gamertag: g, ...s })) });
 });
 
-// ── REST: Voice states ────────────────────────────────
 app.get('/voice-states', (req, res) => {
-  const states = Array.from(voiceDetectionStates.entries()).map(([gamertag, s]) => ({ gamertag, ...s }));
-  res.json({ voiceStates: states });
+  res.json({ voiceStates: Array.from(voiceDetectionStates.entries()).map(([g, s]) => ({ gamertag: g, ...s })) });
 });
 
-// ── REST: Gamertag validation ─────────────────────────
+// ── REST: Gamertag validation (with timeout) ──────────
 app.get('/gamertag/:tag', async (req, res) => {
   const tag = req.params.tag;
   try {
-    const { data: html } = await axios.get(`https://xboxgamertag.com/search/${encodeURIComponent(tag)}`);
+    const { data: html } = await axios.get(
+      `https://xboxgamertag.com/search/${encodeURIComponent(tag)}`,
+      { timeout: 5000 } // 5 second timeout — was missing before
+    );
     res.json({ gamertag: tag, exists: html.includes('Gamerscore') });
   } catch (err) {
     res.status(500).json({ error: 'Verification failed', message: err.message });
@@ -129,35 +122,43 @@ app.get('/gamertag/:tag', async (req, res) => {
 wss.on('connection', (ws) => {
   console.log('🔌 Client connected');
 
-  // Send current Minecraft state if available
-  if (minecraftData) {
-    ws.send(JSON.stringify(buildMinecraftPayload()));
-  }
+  // Rate limiting: max 60 messages per second per client
+  let msgCount = 0;
+  const rateLimitInterval = setInterval(() => { msgCount = 0; }, 1000);
+
+  if (minecraftData) sendJSON(ws, buildMinecraftPayload());
 
   ws.on('message', (raw) => {
+    // Rate limit check
+    if (++msgCount > 60) return;
+
     let data;
     try { data = JSON.parse(raw.toString()); }
     catch { return; }
 
     // ─── JOIN ───────────────────────────────────────
     if (data.type === 'join') {
-      if (isGamertagTaken(data.gamertag)) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Gamertag already in use. Choose a different one.' }));
+      if (!data.gamertag || typeof data.gamertag !== 'string') return;
+      const gamertag = data.gamertag.trim().slice(0, 64);
+
+      if (isGamertagTaken(gamertag)) {
+        sendJSON(ws, { type: 'error', message: 'Gamertag already in use.' });
         ws.close();
         return;
       }
 
-      clients.set(ws, { gamertag: data.gamertag });
-      pttStates.set(data.gamertag,            { isTalking: true,  isMuted: false });
-      voiceDetectionStates.set(data.gamertag, { isTalking: false, volume: 0 });
+      clients.set(ws, { gamertag });
+      gamertagIndex.set(gamertag, ws);
+      pttStates.set(gamertag,            { isTalking: true,  isMuted: false });
+      voiceDetectionStates.set(gamertag, { isTalking: false, volume: 0 });
 
-      console.log(`👤 ${data.gamertag} joined (${clients.size} total)`);
+      console.log(`👤 ${gamertag} joined (${clients.size} total)`);
 
-      broadcast(ws, { type: 'join', gamertag: data.gamertag });
+      // Tell others someone joined
+      broadcast({ type: 'join', gamertag }, ws);
 
-      const list = getParticipantsList();
-      ws.send(JSON.stringify({ type: 'participants-list', list }));
-      broadcast(ws, { type: 'participants-list', list });
+      // Send the full participant list only to the new joiner
+      sendJSON(ws, { type: 'participants-list', list: getParticipantsList() });
       return;
     }
 
@@ -169,29 +170,31 @@ wss.on('connection', (ws) => {
 
     // ─── VOICE DETECTION ────────────────────────────
     if (data.type === 'voice-detection') {
-      voiceDetectionStates.set(data.gamertag, {
-        isTalking: data.isTalking,
-        volume:    data.volume || 0,
+      const clientData = clients.get(ws);
+      if (!clientData) return;
+      voiceDetectionStates.set(clientData.gamertag, {
+        isTalking: !!data.isTalking,
+        volume:    typeof data.volume === 'number' ? data.volume : 0,
       });
-      // Minecraft plugin will pick this up on the next POST
+      // No broadcast here — Minecraft plugin picks it up on next POST
       return;
     }
 
     // ─── PTT STATUS ─────────────────────────────────
     if (data.type === 'ptt-status') {
-      pttStates.set(data.gamertag, { isTalking: data.isTalking, isMuted: data.isMuted });
-      console.log(`🎙️ PTT: ${data.gamertag} → ${data.isTalking ? 'TALKING' : 'MUTED'}`);
-      broadcastToAll({ type: 'ptt-update', gamertag: data.gamertag, isTalking: data.isTalking, isMuted: data.isMuted });
+      const clientData = clients.get(ws);
+      if (!clientData) return;
+      const { gamertag } = clientData;
+      pttStates.set(gamertag, { isTalking: !!data.isTalking, isMuted: !!data.isMuted });
+      broadcast({ type: 'ptt-update', gamertag, isTalking: !!data.isTalking, isMuted: !!data.isMuted });
       return;
     }
 
     // ─── WEBRTC SIGNALING ───────────────────────────
     if (['offer', 'answer', 'ice-candidate'].includes(data.type)) {
       if (!data.to || !data.from) return;
-      let targetWs = null;
-      for (const [clientWs, d] of clients) {
-        if (d.gamertag === data.to) { targetWs = clientWs; break; }
-      }
+      // O(1) lookup via index instead of O(n) loop
+      const targetWs = gamertagIndex.get(data.to);
       if (targetWs?.readyState === 1) {
         targetWs.send(JSON.stringify(data));
         if (data.type !== 'ice-candidate') console.log(`📨 ${data.type}: ${data.from} → ${data.to}`);
@@ -206,16 +209,18 @@ wss.on('connection', (ws) => {
 
     // ─── REQUEST PARTICIPANTS ───────────────────────
     if (data.type === 'request-participants') {
-      const list = getParticipantsList();
-      ws.send(JSON.stringify({ type: 'participants-list', list }));
-      broadcastToAll({ type: 'participants-list', list });
+      // Only send to the requester — no need to broadcast to everyone
+      sendJSON(ws, { type: 'participants-list', list: getParticipantsList() });
       return;
     }
 
     console.warn(`⚠️ Unknown message type: ${data.type}`);
   });
 
-  ws.on('close', () => _handleLeave(ws));
+  ws.on('close', () => {
+    clearInterval(rateLimitInterval);
+    _handleLeave(ws);
+  });
 
   ws.on('error', (err) => {
     const d = clients.get(ws);
@@ -229,21 +234,20 @@ function _handleLeave(ws) {
 
   const { gamertag } = clientData;
   clients.delete(ws);
+  gamertagIndex.delete(gamertag);
   pttStates.delete(gamertag);
   voiceDetectionStates.delete(gamertag);
 
   console.log(`👋 ${gamertag} left (${clients.size} remaining)`);
 
-  broadcast(ws, { type: 'leave', gamertag });
-
-  const list = getParticipantsList();
-  broadcastToAll({ type: 'participants-list', list });
+  // Tell everyone else, with updated list
+  broadcast({ type: 'leave', gamertag });
 }
 
 // ── GRACEFUL SHUTDOWN ─────────────────────────────────
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down...');
-  broadcastToAll({ type: 'server-shutdown' });
+  broadcast({ type: 'server-shutdown' });
   wss.clients.forEach(c => c.close());
   server.close(() => { console.log('✅ Server closed'); process.exit(0); });
 });
@@ -251,7 +255,7 @@ process.on('SIGINT', () => {
 // ── START ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`\n🚀 EnviroVoice Server v3.0`);
+  console.log(`\n🚀 EnviroVoice Server v3.1`);
   console.log(`🌐 HTTP/WS  → http://localhost:${PORT}`);
   console.log(`🎮 Minecraft → POST /minecraft-data`);
   console.log(`💚 Health   → GET  /health`);
